@@ -16,4 +16,4 @@ ENV SMTP_PORT=25252
 VOLUME ["/app"]
 
 # 启动命令
-CMD ["python", "-u", "smtp_webhook.py"]
+CMD ["python", "-u", "smtp_webhook_docker.py"]
