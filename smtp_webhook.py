@@ -4,13 +4,16 @@
     This script implements a simple SMTP server that forwards received emails
     to a specified webhook URL, logging the details of each email.
 """
+import time
 from aiosmtpd.controller import Controller
 import requests
 import logging
 import email
 from email.header import decode_header
 from email.utils import parseaddr
-import os,socket,time
+import os,socket
+import threading
+from datetime import datetime, timedelta
 
 # 配置日志，写入文件和控制台
 log_path = os.path.join(os.path.dirname(__file__), "smtp.log")
@@ -25,15 +28,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# 从环境变量获取配置
-WEBHOOK_URL = os.getenv('WEBHOOK_URL', 'http://localhost:8080/webhook')
-SMTP_PORT = int(os.getenv('SMTP_PORT', '25252'))
-
 
 class WebhookForwarder:
-    def __init__(self, webhook_url):
+    def __init__(self, webhook_url, cache, lock):
         self.webhook_url = webhook_url
-    
+        self.cache = cache
+        self.lock = lock
+
     async def handle_DATA(self, server, session, envelope):
         msg_bytes = envelope.content
         msg = email.message_from_bytes(msg_bytes)
@@ -93,27 +94,70 @@ class WebhookForwarder:
 
         return b'250 Message accepted for delivery'
 
+def batch_forwarder(cache, lock, webhook_url):
+    while True:
+        time.sleep(300)  # 5分钟
+        with lock:
+            if not cache:
+                continue
+            # 合并所有邮件
+            content = ""
+            for mail in cache:
+                content += (
+                    f"from {mail['sender']} \nto {', '.join(mail['recipients'])} "
+                    f"\nsubject: {mail['subject']}\n\n{mail['body']}\n"
+                    f"{'-'*40}\n"
+                )
+            cache.clear()
+        # 发送到 webhook
+        try:
+            response = requests.post(
+                webhook_url,
+                json={
+                    "msgtype": "text",
+                    "text": {
+                        "content": content
+                    },
+                },
+                timeout=10
+            )
+            if response.status_code == 200:
+                logger.info('200 批量Webhook通知已发送')
+            else:
+                logger.info('550 批量Webhook通知失败')
+        except Exception as e:
+            logger.error(f"批量转发出错: {str(e)}")
+
 def run_smtp_server():
     SMTP_HOST = get_local_ip()
-    # SMTP_PORT = 25252
+    SMTP_PORT = 25252
+    WEBHOOK_URL = "http://localhost:8080/webhook"  # 替换为实际的Webhook URL
     logger.info(f"本地局域网IP地址: {SMTP_HOST}")
     logger.info(f"Starting SMTP server on {SMTP_HOST}:{SMTP_PORT}")
     logger.info(f"Webhook target: {WEBHOOK_URL}")
 
+    cache = []
+    lock = threading.Lock()
+
+    # 启动批量转发线程
+    t = threading.Thread(target=batch_forwarder, args=(cache, lock, WEBHOOK_URL), daemon=True)
+    t.start()
+
     controller = Controller(
-        WebhookForwarder(WEBHOOK_URL),
+        WebhookForwarder(WEBHOOK_URL, cache, lock),
         hostname=SMTP_HOST,
         port=SMTP_PORT
     )
     controller.start()
     try:
         while True:
-            time.sleep(600)
+            time.sleep(600)  # Keep the server running
     except KeyboardInterrupt:
         pass
     finally:
         logger.info("Shutting down server...")
         controller.stop()
+
 
 
 def get_local_ip():
